@@ -1,3 +1,9 @@
+import os
+
+# Default layer indices to capture hidden states from
+DEFAULT_LAYER_INDICES = [7, 14, 21, 28]
+
+
 def register():
     from vllm import ModelRegistry
     from vllm.transformers_utils.configs.speculators.algos import (
@@ -38,3 +44,46 @@ def register():
             "HookBasedHiddenStatesConnector",
         )
         print("HookBasedHiddenStatesConnector registered")
+    
+    # Monkey-patch Qwen3 model to register hooks after initialization
+    _patch_qwen3_model()
+
+
+def _patch_qwen3_model():
+    """
+    Monkey-patch the Qwen3 model to register forward hooks after initialization.
+    """
+    try:
+        from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
+        from vllm_hidden_states_extractor.model_wrapper import register_hooks_on_model
+        
+        # Store the original __init__
+        original_init = Qwen3ForCausalLM.__init__
+        
+        def patched_init(self, *args, **kwargs):
+            # Call original init
+            original_init(self, *args, **kwargs)
+            
+            # Register hooks if environment variable is set
+            layer_indices_str = os.environ.get("HIDDEN_STATES_LAYER_INDICES", "")
+            if layer_indices_str:
+                layer_indices = [int(x) for x in layer_indices_str.split(",")]
+            else:
+                layer_indices = DEFAULT_LAYER_INDICES
+            
+            # Check if we should register hooks (based on env var or config)
+            if os.environ.get("ENABLE_HIDDEN_STATES_HOOKS", "0") == "1":
+                try:
+                    handles = register_hooks_on_model(self, layer_indices)
+                    self._hidden_state_hook_handles = handles
+                    print(f"Registered {len(handles)} hidden state hooks on Qwen3 model")
+                except Exception as e:
+                    print(f"Warning: Failed to register hooks: {e}")
+        
+        Qwen3ForCausalLM.__init__ = patched_init
+        print("Qwen3ForCausalLM patched for hidden state hooks")
+        
+    except ImportError as e:
+        print(f"Warning: Could not patch Qwen3 model: {e}")
+    except Exception as e:
+        print(f"Warning: Error patching Qwen3 model: {e}")
