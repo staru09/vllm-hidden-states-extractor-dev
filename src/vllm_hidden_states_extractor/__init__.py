@@ -1,4 +1,5 @@
 import os
+import functools
 
 # Default layer indices to capture hidden states from
 DEFAULT_LAYER_INDICES = [7, 14, 21, 28]
@@ -60,19 +61,19 @@ def _patch_qwen3_model():
         # Store the original __init__
         original_init = Qwen3ForCausalLM.__init__
         
-        def patched_init(self, *args, **kwargs):
-            # Call original init
-            original_init(self, *args, **kwargs)
+        @functools.wraps(original_init)
+        def patched_init(self, *, vllm_config, prefix: str = "", **kwargs):
+            # Call original init with proper keyword arguments
+            original_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
             
             # Register hooks if environment variable is set
-            layer_indices_str = os.environ.get("HIDDEN_STATES_LAYER_INDICES", "")
-            if layer_indices_str:
-                layer_indices = [int(x) for x in layer_indices_str.split(",")]
-            else:
-                layer_indices = DEFAULT_LAYER_INDICES
-            
-            # Check if we should register hooks (based on env var or config)
             if os.environ.get("ENABLE_HIDDEN_STATES_HOOKS", "0") == "1":
+                layer_indices_str = os.environ.get("HIDDEN_STATES_LAYER_INDICES", "")
+                if layer_indices_str:
+                    layer_indices = [int(x) for x in layer_indices_str.split(",")]
+                else:
+                    layer_indices = DEFAULT_LAYER_INDICES
+                
                 try:
                     handles = register_hooks_on_model(self, layer_indices)
                     self._hidden_state_hook_handles = handles
