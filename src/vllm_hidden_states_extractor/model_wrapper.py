@@ -3,10 +3,12 @@
 
 """
 Qwen3 wrapper model that adds forward hooks for hidden states extraction.
+
+Note: Hooks must be compatible with torch.compile, so we avoid using
+Python threading locks or other unsupported context managers.
 """
 
 import os
-import threading
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,8 +20,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # Global storage for captured hidden states
+# Note: No threading lock - torch.compile doesn't support it
 _captured_hidden_states: Dict[int, List[torch.Tensor]] = OrderedDict()
-_capture_lock = threading.Lock()
 _current_request_info: Dict[str, Any] = {}
 
 
@@ -31,8 +33,7 @@ def get_captured_states() -> Dict[int, List[torch.Tensor]]:
 def clear_captured_states():
     """Clear the captured hidden states."""
     global _captured_hidden_states
-    with _capture_lock:
-        _captured_hidden_states.clear()
+    _captured_hidden_states.clear()
 
 
 def set_current_request(req_id: str, token_ids: List[int], save_path: str):
@@ -49,56 +50,61 @@ def save_captured_states_for_request() -> Optional[str]:
     """Save captured states for the current request."""
     global _captured_hidden_states, _current_request_info
     
-    with _capture_lock:
-        if not _captured_hidden_states:
-            logger.warning("No hidden states captured")
-            return None
-        
-        req_info = _current_request_info
-        if not req_info:
-            logger.warning("No request info set")
-            return None
-        
-        save_dir = req_info.get("save_path", "/tmp/hidden_states")
-        req_id = req_info.get("req_id", "unknown")
-        token_ids = req_info.get("token_ids", [])
-        
-        os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, f"{req_id}.safetensors")
-        
-        tensors = {}
-        for layer_idx, states_list in sorted(_captured_hidden_states.items()):
-            if states_list:
-                stacked = torch.cat(states_list, dim=0)
-                tensors[f"layer_{layer_idx}"] = stacked
-        
-        if token_ids:
-            tensors["token_ids"] = torch.tensor(token_ids, dtype=torch.long)
-        
-        if tensors:
-            save_file(tensors, filename)
-            logger.info(f"Saved hidden states from {len(_captured_hidden_states)} layers to {filename}")
-        
-        _captured_hidden_states.clear()
-        return filename
+    if not _captured_hidden_states:
+        logger.warning("No hidden states captured")
+        return None
+    
+    req_info = _current_request_info
+    if not req_info:
+        logger.warning("No request info set")
+        return None
+    
+    save_dir = req_info.get("save_path", "/tmp/hidden_states")
+    req_id = req_info.get("req_id", "unknown")
+    token_ids = req_info.get("token_ids", [])
+    
+    os.makedirs(save_dir, exist_ok=True)
+    filename = os.path.join(save_dir, f"{req_id}.safetensors")
+    
+    tensors = {}
+    for layer_idx, states_list in sorted(_captured_hidden_states.items()):
+        if states_list:
+            stacked = torch.cat(states_list, dim=0)
+            tensors[f"layer_{layer_idx}"] = stacked
+    
+    if token_ids:
+        tensors["token_ids"] = torch.tensor(token_ids, dtype=torch.long)
+    
+    if tensors:
+        save_file(tensors, filename)
+        logger.info(f"Saved hidden states from {len(_captured_hidden_states)} layers to {filename}")
+    
+    _captured_hidden_states.clear()
+    return filename
 
 
 def create_layer_hook(layer_idx: int):
-    """Create a forward hook for a specific layer."""
+    """
+    Create a forward hook for a specific layer.
+    
+    Note: This hook must be compatible with torch.compile.
+    Do NOT use threading locks or other unsupported constructs.
+    """
     def hook(module, input, output):
-        with _capture_lock:
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-            else:
-                hidden_states = output
-            
-            if layer_idx not in _captured_hidden_states:
-                _captured_hidden_states[layer_idx] = []
-            
-            # Clone and detach to CPU
-            _captured_hidden_states[layer_idx].append(
-                hidden_states.detach().clone().cpu()
-            )
+        # Extract hidden states from output
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+        else:
+            hidden_states = output
+        
+        # Initialize list for this layer if needed
+        if layer_idx not in _captured_hidden_states:
+            _captured_hidden_states[layer_idx] = []
+        
+        # Clone and move to CPU (detached from computation graph)
+        _captured_hidden_states[layer_idx].append(
+            hidden_states.detach().clone().cpu()
+        )
             
     return hook
 
