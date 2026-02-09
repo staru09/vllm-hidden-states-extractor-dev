@@ -22,9 +22,19 @@ def register():
             "vllm_hidden_states_extractor.model:HiddenStatesExtractor",
         )
 
+    # Register the original connector (uses fake attention layers)
     if "ExampleHiddenStatesConnector" not in KVConnectorFactory._registry:
         KVConnectorFactory.register_connector(
             "ExampleHiddenStatesConnector",
             "vllm_hidden_states_extractor.connector",
             "ExampleHiddenStatesConnector",
         )
+
+    # Register the new hook-based connector (uses forward hooks on real model)
+    if "HookBasedHiddenStatesConnector" not in KVConnectorFactory._registry:
+        KVConnectorFactory.register_connector(
+            "HookBasedHiddenStatesConnector",
+            "vllm_hidden_states_extractor.hook_connector",
+            "HookBasedHiddenStatesConnector",
+        )
+        print("HookBasedHiddenStatesConnector registered")
