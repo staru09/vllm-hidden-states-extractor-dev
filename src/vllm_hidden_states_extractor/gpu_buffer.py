@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-GPU Buffer Manager for hidden states tap-out.
+GPU Buffer Manager for hidden activations extraction.
 
 Manages a pool of GPU-resident tensors with handle-based access.
 Tensors stay on GPU and are accessible via CUDA IPC handles

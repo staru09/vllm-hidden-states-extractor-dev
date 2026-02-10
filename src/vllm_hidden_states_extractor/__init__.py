@@ -31,22 +31,22 @@ def register():
             "ExampleHiddenStatesConnector",
         )
 
-    # ── New GPU-resident tap connector ──
-    if "HiddenStateTapConnector" not in KVConnectorFactory._registry:
+    # ── New GPU-resident activation connector ──
+    if "HiddenActivationsConnector" not in KVConnectorFactory._registry:
         KVConnectorFactory.register_connector(
-            "HiddenStateTapConnector",
-            "vllm_hidden_states_extractor.hidden_tap",
-            "HiddenStateTapConnector",
+            "HiddenActivationsConnector",
+            "vllm_hidden_states_extractor.hidden_activations",
+            "HiddenActivationsConnector",
         )
-        print("HiddenStateTapConnector registered")
+        print("HiddenActivationsConnector registered")
 
-    # Patch model classes to register tap hooks on initialization
-    if os.environ.get("HIDDEN_TAP_ENABLED", "0") == "1":
-        tap_layer = int(os.environ.get("HIDDEN_TAP_LAYER", "20"))
-        _patch_model_for_tap(tap_layer)
+    # Patch model classes to register activation hooks on initialization
+    if os.environ.get("HIDDEN_ACTIVATIONS_ENABLED", "0") == "1":
+        activation_layer = int(os.environ.get("HIDDEN_ACTIVATIONS_LAYER", "20"))
+        _patch_model_for_activations(activation_layer)
 
 
-def _patch_model_for_tap(tap_layer: int):
+def _patch_model_for_activations(activation_layer: int):
     """
     Monkey-patch supported model classes to register a forward hook
     on the target layer after initialization.
@@ -63,15 +63,15 @@ def _patch_model_for_tap(tap_layer: int):
             import importlib
             mod = importlib.import_module(module_path)
             model_cls = getattr(mod, class_name)
-            _apply_tap_patch(model_cls, class_name, tap_layer)
+            _apply_activation_patch(model_cls, class_name, activation_layer)
         except (ImportError, AttributeError):
             # Model not available in this vLLM install, skip
             pass
 
 
-def _apply_tap_patch(model_cls, class_name: str, tap_layer: int):
-    """Apply the tap hook patch to a single model class."""
-    from vllm_hidden_states_extractor.hidden_tap import register_tap_hooks
+def _apply_activation_patch(model_cls, class_name: str, activation_layer: int):
+    """Apply the activation hook patch to a single model class."""
+    from vllm_hidden_states_extractor.hidden_activations import register_activation_hooks
 
     original_init = model_cls.__init__
 
@@ -80,11 +80,11 @@ def _apply_tap_patch(model_cls, class_name: str, tap_layer: int):
         original_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
 
         try:
-            handles = register_tap_hooks(self, tap_layer)
-            self._tap_hook_handles = handles
-            print(f"[HiddenTap] Registered tap on layer {tap_layer} of {class_name}")
+            handles = register_activation_hooks(self, activation_layer)
+            self._activation_hook_handles = handles
+            print(f"[HiddenActivations] Registered hook on layer {activation_layer} of {class_name}")
         except Exception as e:
-            print(f"[HiddenTap] Warning: Failed to register tap on {class_name}: {e}")
+            print(f"[HiddenActivations] Warning: Failed to register hook on {class_name}: {e}")
 
     model_cls.__init__ = patched_init
-    print(f"[HiddenTap] {class_name} patched for tap hooks")
+    print(f"[HiddenActivations] {class_name} patched for activation hooks")

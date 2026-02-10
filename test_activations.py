@@ -1,5 +1,5 @@
 """
-Test script for the GPU-resident hidden states tap-out system.
+Test script for the GPU-resident hidden states extraction system.
 
 Sends a request to the vLLM server and shows:
 1. Generated text output
@@ -7,9 +7,9 @@ Sends a request to the vLLM server and shows:
 3. Shape, dtype, and layer info of the captured states
 
 Usage:
-    python test_tap.py
-    python test_tap.py --prompt "Explain gravity" --max-tokens 100
-    python test_tap.py --model meta-llama/Llama-3.1-8B
+    python test_activations.py
+    python test_activations.py --prompt "Explain gravity" --max-tokens 100
+    python test_activations.py --model meta-llama/Llama-3.1-8B
 """
 
 import argparse
@@ -20,7 +20,7 @@ import requests
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test hidden state tap")
+    parser = argparse.ArgumentParser(description="Test hidden state extraction")
     parser.add_argument("--url", default="http://localhost:8000")
     parser.add_argument("--prompt", default="What is the capital of France?")
     parser.add_argument("--max-tokens", type=int, default=50)
@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
-    print(f"  Hidden State Tap Test")
+    print(f"  Hidden Activations Test")
     print(f"{'='*60}")
     print(f"  Prompt:     {args.prompt}")
     print(f"  Max tokens: {args.max_tokens}")
@@ -49,11 +49,11 @@ def main():
     except requests.exceptions.ConnectionError:
         print(f"  ✗ Cannot connect to {args.url}")
         print(f"    Start with:")
-        print(f"    HIDDEN_TAP_ENABLED=1 vllm serve {args.model} --enforce-eager \\")
+        print(f"    HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve {args.model} --enforce-eager \\")
         print(f'      --kv-transfer-config \'{{')
-        print(f'        "kv_connector": "HiddenStateTapConnector",')
+        print(f'        "kv_connector": "HiddenActivationsConnector",')
         print(f'        "kv_role": "kv_producer",')
-        print(f'        "kv_connector_extra_config": {{"tap_layer": 20}}')
+        print(f'        "kv_connector_extra_config": {{"activation_layer": 20}}')
         print(f"      }}'")
         sys.exit(1)
 

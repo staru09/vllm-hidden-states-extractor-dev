@@ -1,80 +1,250 @@
 # vllm-hidden-states-extractor
-PoC Plugin for extracting hidden states from vLLM.
+
+Plugin for extracting hidden states from models served by vLLM.
+
+Provides two approaches for hidden states extraction:
+
+1. **KV Cache Extraction** (Original) — Uses a dummy Eagle3 speculator model to capture hidden states from the KV cache and save to disk.
+2. **GPU-Resident Activations** (New) — Uses PyTorch forward hooks to capture actual layer activations, keeping them on GPU with handle-based access (no CPU sync).
+
+## Installation
+
+```bash
+uv pip install -e .
+# or
+pip install -e .
+```
+
+> **Note:** vLLM 0.14.0 is a dependency and will be installed automatically.
+
+---
+
+## Approach 1: KV Cache Extraction (Original)
 
 ![Diagram showing the overall flow of the PoC](./assets/plugin-flow.png)
 
-This plugin works as follows:
-- Create a dummy Eagle3 model with `eagle_aux_hidden_state_layer_ids` set to the layers to extract hidden states from.
-- Existing vLLM plumbing will pass those hidden states into the dummy model's forward fn.
-- The dummy model will cache the hidden states into its layers "KV cache". Its layers are fake "attention" layers that only cache the hidden states and then return garbage.
-- A custom KV connector is used to extract hidden states from only the fake "attention" layers and (in for the PoC) save them to disk. 
+This approach works as follows:
 
-## Usage
-Current usage during experimentation is:
+- Creates a dummy Eagle3 model with `eagle_aux_hidden_state_layer_ids` set to the layers to extract hidden states from.
+- Existing vLLM plumbing passes those hidden states into the dummy model's forward function.
+- The dummy model caches the hidden states into its layers' "KV cache" using fake attention layers.
+- A custom KV connector extracts hidden states from the fake attention layers and saves them to disk.
 
-1. Install vllm and this plugin:
+### Usage
+
+1. Serve the model:
+
 ```bash
-uv pip install -e . 
+vllm serve ./demo/qwen3_8b \
+  --kv-transfer-config '{
+    "kv_connector": "ExampleHiddenStatesConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {"shared_storage_path": "/tmp/hidden_states"}
+  }'
 ```
-Note: vLLM 0.14.0 is a dependency of the plugin and will be installed automatically.
 
-2. Serve the model with kv connector
+For model config details, see `demo/qwen3_8b/README.md`.
+
+2. Send a request:
+
 ```bash
-vllm serve ./demo/qwen3_8b --kv-transfer-config '{"kv_connector":"ExampleHiddenStatesConnector","kv_role":"kv_producer","kv_connector_extra_config": {"shared_storage_path": "/tmp/hidden_states"}}'
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "./demo/qwen3_8b",
+    "prompt": "Why are hidden states required for Eagle3 training?"
+  }'
 ```
 
-For more information on the model config, see `demo/qwen3_8b/README.md`.
+3. Verify output — hidden states are saved to `/tmp/hidden_states/{request_id}.safetensors` (path returned in `kv_transfer_params`):
+   - `hidden_states`: `[num_layers=4, seq_len, hidden_size]`
+   - `token_ids`: `[seq_len]`
 
-3. Send a request to the model:
+---
+
+## Approach 2: GPU-Resident Activations (New)
+
+This approach uses PyTorch forward hooks to capture actual layer activations during inference. **Tensors stay on GPU** — no CPU transfer. A buffer handle is returned in the API response for later consumption.
+
+### How it works
+
+```mermaid
+flowchart TD
+    subgraph "Startup (Plugin Registration)"
+        A["vLLM loads plugin<br/><code>__init__.py:register()</code>"] --> B["Register HiddenActivationsConnector<br/>in KVConnectorFactory"]
+        B --> C{"HIDDEN_ACTIVATIONS_ENABLED=1?"}
+        C -->|Yes| D["Monkey-patch model classes<br/>(LlamaForCausalLM, Qwen3ForCausalLM)"]
+        C -->|No| E["Skip patching"]
+    end
+
+    subgraph "Model Loading"
+        F["vLLM loads model weights"] --> G["Patched __init__ runs"]
+        G --> H["Original model init<br/>(loads weights normally)"]
+        H --> I["register_activation_hooks(model, layer_idx)"]
+        I --> J["PyTorch forward hook<br/>attached to Layer N"]
+    end
+
+    subgraph "Connector Init"
+        K["HiddenActivationsConnector.__init__"] --> L["init_global_buffer()<br/>(GPU ring buffer created)"]
+        L --> M["Set _capture_enabled = True"]
+    end
+
+    A --> F
+    A --> K
+```
+
+```mermaid
+flowchart LR
+    subgraph "Request Flow"
+        A["Client sends prompt"] --> B["vLLM Scheduler"]
+        B -->|"build_connector_meta()"| C["Track active request IDs"]
+        C --> D["Model Forward Pass"]
+
+        D --> E["Layer 0...N-1"]
+        E --> F["Layer N (hooked)"]
+        F --> G{"Hook fires"}
+        G -->|"tensor.detach().clone()"| H["GPU Buffer Manager<br/>(tensor stays on GPU)"]
+        G --> I["Layer N+1...Last"]
+        I --> J["Logits → Sampling"]
+
+        J --> K["request_finished()"]
+        K -->|"Read handle from buffer"| H
+        K --> L["Response to client"]
+    end
+
+    subgraph "Response"
+        L --> M["Generated text<br/>+ hidden_states_handle<br/>+ shape, dtype, layer"]
+    end
+
+    subgraph "Consumer (same process)"
+        N["HiddenStatesConsumer"] -->|"get(handle)"| H
+        N --> O["Your model<br/>(runs on GPU tensor)"]
+    end
+```
+
+### Usage
+
+1. Serve the model with the activation connector (requires `--enforce-eager`):
+
 ```bash
-curl http://localhost:8000/v1/completions     -H "Content-Type: application/json"     -d '{
-        "model": "./demo/qwen3_8b",
-        "prompt": "Why are hidden states required for Eagle3 training?"
-    }'
+HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve Qwen/Qwen3-8B --enforce-eager \
+  --kv-transfer-config '{
+    "kv_connector": "HiddenActivationsConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {"activation_layer": 20, "buffer_size": 64, "buffer_ttl": 30}
+  }'
 ```
-4. Verify the hidden states are extracted.
-These will be saved to `/tmp/hidden_states/{request_id}/hidden_states.safetensors` (the full filepath is returned in the kv transfer params section of the response). For this PoC
-they are stored as a safetensors file with two tensors: 
-  - "hidden_states": [num_hidden_states=4, seq_len, hidden_size] 
-  - "token_ids": [seq_len]
 
-  Note: the 4 is because we are extracting 4 hidden states.
+**Configuration options:**
+| Option | Default | Description |
+|---|---|---|
+| `activation_layer` | `20` | Which transformer layer to capture |
+| `buffer_size` | `64` | Max number of tensors kept in GPU buffer |
+| `buffer_ttl` | `30.0` | Seconds before unclaimed tensors are freed |
+
+2. Send a request:
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-8B",
+    "prompt": "What is the capital of France?",
+    "max_tokens": 50
+  }'
+```
+
+3. Response includes GPU-resident hidden states info:
+
+```json
+{
+  "kv_transfer_params": {
+    "hidden_states_handle": "d8bc117d-1e3",
+    "hidden_states_shape": [7, 4096],
+    "hidden_states_dtype": "torch.bfloat16",
+    "hidden_states_layer": 20,
+    "hidden_states_device": "gpu"
+  }
+}
+```
+
+4. Consume the tensor (from the same process):
+
+```python
+from vllm_hidden_states_extractor.consumer import HiddenStatesConsumer
+
+consumer = HiddenStatesConsumer()
+tensor, metadata = consumer.get("d8bc117d-1e3")
+# tensor is on GPU, shape [7, 4096], bfloat16
+output = my_model(tensor)
+consumer.free("d8bc117d-1e3")
+```
+
+### Supported Models
+
+The activations connector automatically patches these model classes:
+
+- `LlamaForCausalLM` (Llama 3, etc.)
+- `Qwen3ForCausalLM` (Qwen3)
+
+### Test Script
+
+```bash
+python test_activations.py
+python test_activations.py --prompt "Explain gravity" --model meta-llama/Llama-3.1-8B
+```
+
+---
+
+## Comparison
+
+| Feature              | KV Cache Extraction    | GPU-Resident Activations        |
+| -------------------- | ---------------------- | ------------------------------- |
+| Data captured        | KV cache (keys/values) | Layer activations               |
+| Storage              | Disk (safetensors)     | GPU buffer (handles)            |
+| CPU sync             | Yes (GPU→CPU→disk)     | No                              |
+| torch.compile        | Yes                    | No (`--enforce-eager` required) |
+| Speculative decoding | Required               | Not needed                      |
+| Best for             | Eagle3 training data   | Real-time inference pipelines   |
+
+---
 
 ## Demo
 
-To run a demo with multiple clients, launch the server with kv connector
-```bash
-
-vllm serve ./demo/qwen3_8b --kv-transfer-config '{"kv_connector":"ExampleHiddenStatesConnector","kv_role":"kv_producer","kv_connector_extra_config": {"shared_storage_path": "/tmp/hidden_states"}}'
-```
-
-and then run
+To run a multi-client demo with the original approach:
 
 ```bash
+vllm serve ./demo/qwen3_8b \
+  --kv-transfer-config '{
+    "kv_connector": "ExampleHiddenStatesConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {"shared_storage_path": "/tmp/hidden_states"}
+  }'
+
 python demo/multi_client_demo.py --num-clients 3 --server-url http://localhost:8000 --model ./demo/qwen3_8b --num-queries 25
 ```
 
-This will launch 3 client processes that will each send 25 requests / client to the server (taken the ShareGPT dataset).
-In the response from the server, the client will receive the filepath where the hidden states are saved. The client then loads the hidden states and verifies that the shapes match the expected shapes.
+---
 
+## Project Structure
 
-## Structure
-In `pyproject.toml`, the plugin is registered
+```
+src/vllm_hidden_states_extractor/
+├── __init__.py        # Plugin registration (models, connectors, model patching)
+├── model.py           # HiddenStatesExtractor dummy model (Approach 1)
+├── attention.py       # CacheOnlyAttentionBackend (Approach 1)
+├── connector.py       # ExampleHiddenStatesConnector (Approach 1)
+├── utils.py           # KV cache reshaping utilities (Approach 1)
+├── gpu_buffer.py      # GPU ring buffer with handle-based access (Approach 2)
+├── hidden_activations.py # HiddenActivationsConnector + forward hooks (Approach 2)
+└── consumer.py        # Client library for reading GPU tensors (Approach 2)
+```
+
+The plugin is registered in `pyproject.toml`:
+
 ```toml
 [project.entry-points."vllm.general_plugins"]
 register_hidden_states_extractor = "vllm_hidden_states_extractor:register"
 ```
-
-When vLLM is initialized, it will call the `register` function in `src/vllm_hidden_states_extractor/__init__.py`, which initializes the plugin.
-
-In `src/vllm_hidden_states_extractor/__init__.py`, the `register` function registers the "HiddenStatesExtractor" model and a fake speculator type "extract_hidden_states" (with its handler function) and the "ExampleHiddenStatesConnector" kv connector.
-
-In `src/vllm_hidden_states_extractor/model.py`, the `HiddenStatesExtractor` model is defined. It is intended to be a dummy model that just caches the received hidden states into its layers "KV cache".
-
-In `src/vllm_hidden_states_extractor/attention.py`, the `CacheOnlyAttentionBackend` is defined. It is a custom attention backend that just caches the received hidden states into its layers "KV cache".
-
-In `src/vllm_hidden_states_extractor/model.py`, the `CacheOnlyAttentionLayer` is defined. It is a custom attention layer intended to work with the `CacheOnlyAttentionBackend`. This is partially needed because otherwise FDSP has a check that finds all `Attention` (official vllm attention class) layers and checks that they are using the FSDP backend. Unfortunately, this will fail for our custom attention backend. By creating a custom attention layer that also subclasses `AttentionLayerBase`, we can bypass this check.
-
-In `src/vllm_hidden_states_extractor/connector.py`, the `ExampleHiddenStatesConnector` is defined. It is a simple kv connector that extracts the kv cache for each request (only from CacheOnlyAttentionLayers), reshapes the layers to match the hidden states shape, and saves them to disk. 
 
 ![Diagram showing the class structure of the HiddenStatesExtractor](./assets/HiddenStatesExtractor.png)

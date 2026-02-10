@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Hidden States Tap-Out Connector for vLLM.
+Hidden Activations Connector for vLLM.
 
-Captures hidden states from a configurable layer during inference,
+Captures hidden activations from a configurable layer during inference,
 stores them in a GPU buffer (no CPU sync), and returns a buffer handle
 in the API response.
 
@@ -51,7 +51,7 @@ _layer_index: int = 20                         # configurable
 _capture_enabled: bool = False
 
 
-def _make_layer_hook(layer_idx: int):
+def _make_activation_hook(layer_idx: int):
     """
     Create a forward hook for a specific layer.
     
@@ -100,13 +100,13 @@ def _make_layer_hook(layer_idx: int):
     return hook
 
 
-def register_tap_hooks(model: torch.nn.Module, layer_idx: int):
+def register_activation_hooks(model: torch.nn.Module, layer_idx: int):
     """
     Register a forward hook on the specified layer of the model.
     
     Args:
         model: The model to register hooks on
-        layer_idx: Which layer to tap (e.g., 20)
+        layer_idx: Which layer to extract activations from (e.g., 20)
         
     Returns:
         List of hook handles
@@ -134,9 +134,9 @@ def register_tap_hooks(model: torch.nn.Module, layer_idx: int):
 
     if layer_idx < len(layers):
         layer = layers[layer_idx]
-        hook_handle = layer.register_forward_hook(_make_layer_hook(layer_idx))
+        hook_handle = layer.register_forward_hook(_make_activation_hook(layer_idx))
         handles.append(hook_handle)
-        logger.info(f"Hidden state tap registered on layer {layer_idx}")
+        logger.info(f"Hidden activations hook registered on layer {layer_idx}")
     else:
         logger.error(f"Layer {layer_idx} out of range (model has {len(layers)} layers)")
 
@@ -146,19 +146,19 @@ def register_tap_hooks(model: torch.nn.Module, layer_idx: int):
 # ─── Connector ───
 
 @dataclass
-class TapConnectorMetadata(KVConnectorMetadata):
+class ActivationsConnectorMetadata(KVConnectorMetadata):
     requests: list = field(default_factory=list)
 
 
-class HiddenStateTapConnector(KVConnectorBase_V1):
+class HiddenActivationsConnector(KVConnectorBase_V1):
     """
-    KV Connector that taps hidden states from a model layer.
+    KV Connector that captures hidden activations from a model layer.
     
     Hidden states are stored in a GPU buffer (no CPU transfer).
     The buffer handle is returned in the API response via kv_transfer_params.
     
     Config (via kv_connector_extra_config):
-        - tap_layer: int = 20          (which layer to tap)
+        - activation_layer: int = 20   (which layer to capture)
         - buffer_size: int = 64        (max number of stored tensors)
         - buffer_ttl: float = 30.0     (seconds before auto-cleanup)
     """
@@ -180,7 +180,7 @@ class HiddenStateTapConnector(KVConnectorBase_V1):
 
         # Read config
         _layer_index = self._kv_transfer_config.get_from_extra_config(
-            "tap_layer", 20
+            "activation_layer", 20
         )
         buffer_size = self._kv_transfer_config.get_from_extra_config(
             "buffer_size", 64
@@ -196,13 +196,13 @@ class HiddenStateTapConnector(KVConnectorBase_V1):
         )
 
         # Enable hooks via env var for model patching
-        os.environ["HIDDEN_TAP_ENABLED"] = "1"
-        os.environ["HIDDEN_TAP_LAYER"] = str(_layer_index)
+        os.environ["HIDDEN_ACTIVATIONS_ENABLED"] = "1"
+        os.environ["HIDDEN_ACTIVATIONS_LAYER"] = str(_layer_index)
 
         _capture_enabled = True
 
         logger.info(
-            f"HiddenStateTapConnector initialized: "
+            f"HiddenActivationsConnector initialized: "
             f"layer={_layer_index}, buffer_size={buffer_size}, ttl={buffer_ttl}s"
         )
 
@@ -246,7 +246,7 @@ class HiddenStateTapConnector(KVConnectorBase_V1):
     ) -> KVConnectorMetadata:
         """Track active requests so the hook knows which requests are running."""
         global _current_active_requests
-        meta = TapConnectorMetadata()
+        meta = ActivationsConnectorMetadata()
 
         # Update active request list for the hook
         new_req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
