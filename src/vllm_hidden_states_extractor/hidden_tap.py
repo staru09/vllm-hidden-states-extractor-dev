@@ -1,0 +1,294 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Hidden States Tap-Out Connector for vLLM.
+
+Captures hidden states from a configurable layer during inference,
+stores them in a GPU buffer (no CPU sync), and returns a buffer handle
+in the API response.
+
+Architecture:
+    1. Plugin patches the model class to register a forward hook on target layer
+    2. Hook captures the layer output and stores in GPUBufferManager (stays on GPU)
+    3. Connector's request_finished() returns the buffer handle in kv_transfer_params
+    4. Consumer process reads the tensor using the handle (via CUDA IPC or co-process API)
+"""
+
+import os
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+import torch
+
+from vllm.v1.attention.backend import AttentionMetadata
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
+)
+from vllm.logger import init_logger
+
+from vllm_hidden_states_extractor.gpu_buffer import (
+    GPUBufferManager,
+    get_global_buffer,
+    init_global_buffer,
+)
+
+if TYPE_CHECKING:
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+logger = init_logger(__name__)
+
+# ─── Global state for hook <-> connector communication ───
+# The hook writes here, the connector reads from here.
+# No locks needed: single-threaded GPU execution in vLLM worker.
+_pending_hidden_states: Dict[str, str] = {}  # req_id -> buffer_handle
+_current_active_requests: List[str] = []      # req_ids being processed
+_layer_index: int = 20                         # configurable
+_capture_enabled: bool = False
+
+
+def _make_layer_hook(buffer: GPUBufferManager, layer_idx: int):
+    """
+    Create a forward hook for a specific layer.
+    
+    The hook captures the layer output tensor, stores it in the
+    GPU buffer manager, and records the handle for the current request.
+    
+    IMPORTANT: No locks, no CPU sync, no torch-unsupported ops.
+    The tensor stays on GPU.
+    """
+    def hook(module, input, output):
+        if not _capture_enabled:
+            return
+        if not _current_active_requests:
+            return
+
+        # Extract hidden states from output
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+        else:
+            hidden_states = output
+
+        # Store in GPU buffer for each active request
+        for req_id in _current_active_requests:
+            if req_id in _pending_hidden_states:
+                # Already captured for this request (multi-step decode)
+                # Append or overwrite based on use case
+                continue
+
+            handle = buffer.store(
+                hidden_states,
+                metadata={
+                    "req_id": req_id,
+                    "layer_idx": layer_idx,
+                    "shape": list(hidden_states.shape),
+                    "dtype": str(hidden_states.dtype),
+                },
+            )
+            _pending_hidden_states[req_id] = handle
+
+    return hook
+
+
+def register_tap_hooks(model: torch.nn.Module, layer_idx: int, buffer: GPUBufferManager):
+    """
+    Register a forward hook on the specified layer of the model.
+    
+    Args:
+        model: The model to register hooks on
+        layer_idx: Which layer to tap (e.g., 20)
+        buffer: GPU buffer manager to store tensors in
+        
+    Returns:
+        List of hook handles
+    """
+    handles = []
+
+    # Find the layers module
+    layers = None
+    for name, module in model.named_modules():
+        if name == 'model.layers' or name.endswith('.model.layers'):
+            layers = module
+            logger.info(f"Found layers at: {name}")
+            break
+
+    if layers is None:
+        for name, module in model.named_modules():
+            if 'layers' in name and isinstance(module, torch.nn.ModuleList):
+                layers = module
+                logger.info(f"Found layers at: {name}")
+                break
+
+    if layers is None:
+        logger.error("Could not find model layers for hook registration")
+        return handles
+
+    if layer_idx < len(layers):
+        layer = layers[layer_idx]
+        hook_handle = layer.register_forward_hook(_make_layer_hook(buffer, layer_idx))
+        handles.append(hook_handle)
+        logger.info(f"Hidden state tap registered on layer {layer_idx}")
+    else:
+        logger.error(f"Layer {layer_idx} out of range (model has {len(layers)} layers)")
+
+    return handles
+
+
+# ─── Connector ───
+
+@dataclass
+class TapConnectorMetadata(KVConnectorMetadata):
+    requests: list = field(default_factory=list)
+
+
+class HiddenStateTapConnector(KVConnectorBase_V1):
+    """
+    KV Connector that taps hidden states from a model layer.
+    
+    Hidden states are stored in a GPU buffer (no CPU transfer).
+    The buffer handle is returned in the API response via kv_transfer_params.
+    
+    Config (via kv_connector_extra_config):
+        - tap_layer: int = 20          (which layer to tap)
+        - buffer_size: int = 64        (max number of stored tensors)
+        - buffer_ttl: float = 30.0     (seconds before auto-cleanup)
+    """
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
+        super().__init__(
+            vllm_config=vllm_config,
+            role=role,
+            kv_cache_config=kv_cache_config,
+        )
+        global _layer_index, _capture_enabled
+
+        self._block_size = vllm_config.cache_config.block_size
+
+        # Read config
+        _layer_index = self._kv_transfer_config.get_from_extra_config(
+            "tap_layer", 20
+        )
+        buffer_size = self._kv_transfer_config.get_from_extra_config(
+            "buffer_size", 64
+        )
+        buffer_ttl = self._kv_transfer_config.get_from_extra_config(
+            "buffer_ttl", 30.0
+        )
+
+        # Initialize global buffer
+        init_global_buffer(
+            max_slots=buffer_size,
+            default_ttl=buffer_ttl,
+        )
+
+        # Enable hooks via env var for model patching
+        os.environ["HIDDEN_TAP_ENABLED"] = "1"
+        os.environ["HIDDEN_TAP_LAYER"] = str(_layer_index)
+
+        _capture_enabled = True
+
+        logger.info(
+            f"HiddenStateTapConnector initialized: "
+            f"layer={_layer_index}, buffer_size={buffer_size}, ttl={buffer_ttl}s"
+        )
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register KV caches."""
+        logger.info(f"Registered {len(kv_caches)} KV cache layers")
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+        pass
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        return
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    def wait_for_save(self):
+        return
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        return 0, False
+
+    def update_state_after_alloc(
+        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    ):
+        pass
+
+    def build_connector_meta(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> KVConnectorMetadata:
+        """Track active requests so the hook knows which requests are running."""
+        global _current_active_requests
+        meta = TapConnectorMetadata()
+
+        # Update active request list for the hook
+        new_req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
+        _current_active_requests = new_req_ids
+
+        return meta
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Return the buffer handle for the captured hidden states."""
+        global _current_active_requests
+
+        req_id = request.request_id
+        handle = _pending_hidden_states.pop(req_id, None)
+
+        # Remove from active list
+        if req_id in _current_active_requests:
+            _current_active_requests.remove(req_id)
+
+        if handle:
+            buffer = get_global_buffer()
+            tensor, metadata = buffer.get(handle)
+            shape = metadata.get("shape", []) if metadata else []
+            dtype = metadata.get("dtype", "") if metadata else ""
+
+            logger.info(
+                f"Request {req_id}: hidden states handle={handle}, "
+                f"shape={shape}, dtype={dtype}"
+            )
+
+            return False, {
+                "hidden_states_handle": handle,
+                "hidden_states_shape": shape,
+                "hidden_states_dtype": dtype,
+                "hidden_states_layer": _layer_index,
+                "hidden_states_device": "gpu",
+            }
+        else:
+            logger.warning(f"No hidden states captured for request {req_id}")
+            return False, {"hidden_states_handle": None}
+
+    def clear_connector_metadata(self):
+        pass
+
+    def real_clear_connector_metadata(self):
+        self._connector_metadata = None

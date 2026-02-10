@@ -1,9 +1,6 @@
 import os
 import functools
 
-# Default layer indices to capture hidden states from
-DEFAULT_LAYER_INDICES = [7, 14, 21, 28]
-
 
 def register():
     from vllm import ModelRegistry
@@ -13,11 +10,9 @@ def register():
     )
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
+    # ── Original speculative decoding approach ──
     @register_speculator("extract_hidden_states")
     def update_extract_hidden_states(config_dict: dict, vllm_config: dict) -> None:
-        """
-        This is a fake speculator that extracts hidden states from the model. It pretends to be an eagle3 speculator.
-        """
         update_eagle3(config_dict, vllm_config)
         vllm_config["method"] = "eagle3"
         vllm_config["architectures"] = ["HiddenStatesExtractor"]
@@ -29,7 +24,6 @@ def register():
             "vllm_hidden_states_extractor.model:HiddenStatesExtractor",
         )
 
-    # Register the original connector (uses fake attention layers)
     if "ExampleHiddenStatesConnector" not in KVConnectorFactory._registry:
         KVConnectorFactory.register_connector(
             "ExampleHiddenStatesConnector",
@@ -37,54 +31,62 @@ def register():
             "ExampleHiddenStatesConnector",
         )
 
-    # Register the new hook-based connector (uses forward hooks on real model)
-    if "HookBasedHiddenStatesConnector" not in KVConnectorFactory._registry:
+    # ── New GPU-resident tap connector ──
+    if "HiddenStateTapConnector" not in KVConnectorFactory._registry:
         KVConnectorFactory.register_connector(
-            "HookBasedHiddenStatesConnector",
-            "vllm_hidden_states_extractor.hook_connector",
-            "HookBasedHiddenStatesConnector",
+            "HiddenStateTapConnector",
+            "vllm_hidden_states_extractor.hidden_tap",
+            "HiddenStateTapConnector",
         )
-        print("HookBasedHiddenStatesConnector registered")
+        print("HiddenStateTapConnector registered")
+
+    # Patch model classes to register tap hooks on initialization
+    if os.environ.get("HIDDEN_TAP_ENABLED", "0") == "1":
+        tap_layer = int(os.environ.get("HIDDEN_TAP_LAYER", "20"))
+        _patch_model_for_tap(tap_layer)
+
+
+def _patch_model_for_tap(tap_layer: int):
+    """
+    Monkey-patch supported model classes to register a forward hook
+    on the target layer after initialization.
     
-    # Monkey-patch Qwen3 model to register hooks after initialization
-    _patch_qwen3_model()
+    Supports: Llama, Qwen3 (add more as needed)
+    """
+    models_to_patch = [
+        ("vllm.model_executor.models.llama", "LlamaForCausalLM"),
+        ("vllm.model_executor.models.qwen3", "Qwen3ForCausalLM"),
+    ]
+
+    for module_path, class_name in models_to_patch:
+        try:
+            import importlib
+            mod = importlib.import_module(module_path)
+            model_cls = getattr(mod, class_name)
+            _apply_tap_patch(model_cls, class_name, tap_layer)
+        except (ImportError, AttributeError):
+            # Model not available in this vLLM install, skip
+            pass
 
 
-def _patch_qwen3_model():
-    """
-    Monkey-patch the Qwen3 model to register forward hooks after initialization.
-    """
-    try:
-        from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
-        from vllm_hidden_states_extractor.model_wrapper import register_hooks_on_model
-        
-        # Store the original __init__
-        original_init = Qwen3ForCausalLM.__init__
-        
-        @functools.wraps(original_init)
-        def patched_init(self, *, vllm_config, prefix: str = "", **kwargs):
-            # Call original init with proper keyword arguments
-            original_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
-            
-            # Register hooks if environment variable is set
-            if os.environ.get("ENABLE_HIDDEN_STATES_HOOKS", "0") == "1":
-                layer_indices_str = os.environ.get("HIDDEN_STATES_LAYER_INDICES", "")
-                if layer_indices_str:
-                    layer_indices = [int(x) for x in layer_indices_str.split(",")]
-                else:
-                    layer_indices = DEFAULT_LAYER_INDICES
-                
-                try:
-                    handles = register_hooks_on_model(self, layer_indices)
-                    self._hidden_state_hook_handles = handles
-                    print(f"Registered {len(handles)} hidden state hooks on Qwen3 model")
-                except Exception as e:
-                    print(f"Warning: Failed to register hooks: {e}")
-        
-        Qwen3ForCausalLM.__init__ = patched_init
-        print("Qwen3ForCausalLM patched for hidden state hooks")
-        
-    except ImportError as e:
-        print(f"Warning: Could not patch Qwen3 model: {e}")
-    except Exception as e:
-        print(f"Warning: Error patching Qwen3 model: {e}")
+def _apply_tap_patch(model_cls, class_name: str, tap_layer: int):
+    """Apply the tap hook patch to a single model class."""
+    from vllm_hidden_states_extractor.hidden_tap import register_tap_hooks
+    from vllm_hidden_states_extractor.gpu_buffer import get_global_buffer
+
+    original_init = model_cls.__init__
+
+    @functools.wraps(original_init)
+    def patched_init(self, *, vllm_config, prefix: str = "", **kwargs):
+        original_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
+
+        buffer = get_global_buffer()
+        try:
+            handles = register_tap_hooks(self, tap_layer, buffer)
+            self._tap_hook_handles = handles
+            print(f"[HiddenTap] Registered tap on layer {tap_layer} of {class_name}")
+        except Exception as e:
+            print(f"[HiddenTap] Warning: Failed to register tap on {class_name}: {e}")
+
+    model_cls.__init__ = patched_init
+    print(f"[HiddenTap] {class_name} patched for tap hooks")
