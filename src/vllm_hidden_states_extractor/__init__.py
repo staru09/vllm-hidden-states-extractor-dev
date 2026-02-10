@@ -72,7 +72,6 @@ def _patch_model_for_tap(tap_layer: int):
 def _apply_tap_patch(model_cls, class_name: str, tap_layer: int):
     """Apply the tap hook patch to a single model class."""
     from vllm_hidden_states_extractor.hidden_tap import register_tap_hooks
-    from vllm_hidden_states_extractor.gpu_buffer import get_global_buffer
 
     original_init = model_cls.__init__
 
@@ -80,9 +79,8 @@ def _apply_tap_patch(model_cls, class_name: str, tap_layer: int):
     def patched_init(self, *, vllm_config, prefix: str = "", **kwargs):
         original_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
 
-        buffer = get_global_buffer()
         try:
-            handles = register_tap_hooks(self, tap_layer, buffer)
+            handles = register_tap_hooks(self, tap_layer)
             self._tap_hook_handles = handles
             print(f"[HiddenTap] Registered tap on layer {tap_layer} of {class_name}")
         except Exception as e:

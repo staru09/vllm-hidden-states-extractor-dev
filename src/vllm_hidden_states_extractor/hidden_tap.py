@@ -29,7 +29,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 
 from vllm_hidden_states_extractor.gpu_buffer import (
-    GPUBufferManager,
     get_global_buffer,
     init_global_buffer,
 )
@@ -52,7 +51,7 @@ _layer_index: int = 20                         # configurable
 _capture_enabled: bool = False
 
 
-def _make_layer_hook(buffer: GPUBufferManager, layer_idx: int):
+def _make_layer_hook(layer_idx: int):
     """
     Create a forward hook for a specific layer.
     
@@ -61,6 +60,10 @@ def _make_layer_hook(buffer: GPUBufferManager, layer_idx: int):
     
     IMPORTANT: No locks, no CPU sync, no torch-unsupported ops.
     The tensor stays on GPU.
+    
+    NOTE: We call get_global_buffer() at runtime (not via closure)
+    to ensure we always use the current buffer instance, even if
+    init_global_buffer() was called after hook registration.
     """
     def hook(module, input, output):
         if not _capture_enabled:
@@ -74,11 +77,13 @@ def _make_layer_hook(buffer: GPUBufferManager, layer_idx: int):
         else:
             hidden_states = output
 
+        # Get the current buffer (not closure-captured)
+        buffer = get_global_buffer()
+
         # Store in GPU buffer for each active request
         for req_id in _current_active_requests:
             if req_id in _pending_hidden_states:
                 # Already captured for this request (multi-step decode)
-                # Append or overwrite based on use case
                 continue
 
             handle = buffer.store(
@@ -95,14 +100,13 @@ def _make_layer_hook(buffer: GPUBufferManager, layer_idx: int):
     return hook
 
 
-def register_tap_hooks(model: torch.nn.Module, layer_idx: int, buffer: GPUBufferManager):
+def register_tap_hooks(model: torch.nn.Module, layer_idx: int):
     """
     Register a forward hook on the specified layer of the model.
     
     Args:
         model: The model to register hooks on
         layer_idx: Which layer to tap (e.g., 20)
-        buffer: GPU buffer manager to store tensors in
         
     Returns:
         List of hook handles
@@ -130,7 +134,7 @@ def register_tap_hooks(model: torch.nn.Module, layer_idx: int, buffer: GPUBuffer
 
     if layer_idx < len(layers):
         layer = layers[layer_idx]
-        hook_handle = layer.register_forward_hook(_make_layer_hook(buffer, layer_idx))
+        hook_handle = layer.register_forward_hook(_make_layer_hook(layer_idx))
         handles.append(hook_handle)
         logger.info(f"Hidden state tap registered on layer {layer_idx}")
     else:
