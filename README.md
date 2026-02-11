@@ -127,7 +127,7 @@ flowchart LR
 1. Serve the model with the activation connector (requires `--enforce-eager`):
 
 ```bash
-HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve Qwen/Qwen3-8B --enforce-eager \
+HIDDEN_STATES_REALTIME_CONSUMER=1 HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve Qwen/Qwen3-8B --enforce-eager \
   --kv-transfer-config '{
     "kv_connector": "HiddenActivationsConnector",
     "kv_role": "kv_producer",
