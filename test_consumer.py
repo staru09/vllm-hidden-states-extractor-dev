@@ -1,12 +1,10 @@
 """
-Consumer test script — inspect streaming hidden state tensors.
+Consumer test script — inspect streaming hidden state tensors via HTTP API.
 
-Sends a request to vLLM, gets the handles back, then either:
-  1. If running IN the vLLM worker process: iterates tensors and shows shapes/stats
-  2. If running as a SEPARATE process: shows handle metadata from the API response
+Sends a generation request, then calls the /hidden_states/consume endpoint
+to inspect each tensor's shape, stats, and get a stacked summary.
 
-For option 1, integrate this into a custom vLLM endpoint or use the
-vLLM entrypoints API to co-locate the consumer.
+Requires: vLLM server started with run_server.py (which mounts the API).
 
 Usage:
     python test_consumer.py
@@ -21,128 +19,14 @@ import sys
 import requests
 
 
-def fetch_hidden_states(url, prompt, max_tokens, model):
-    """Send a completion request and return the response."""
-    resp = requests.post(
-        f"{url}/v1/completions",
-        json={
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def try_consume_in_process(handles):
-    """
-    Try to consume tensors from the in-process GPU buffer.
-    Returns (tensors_list, metadata_list) or (None, None) if not available.
-    """
-    try:
-        from vllm_hidden_states_extractor.consumer import StreamingHiddenStatesConsumer
-        consumer = StreamingHiddenStatesConsumer()
-
-        # Test first handle to see if buffer is populated
-        tensor, meta = consumer._buffer.get(handles[0])
-        if tensor is None:
-            return None, None
-
-        # First one worked — collect all
-        tensors = [tensor]
-        metas = [meta]
-        for handle in handles[1:]:
-            t, m = consumer._buffer.get(handle)
-            if t is not None:
-                tensors.append(t)
-                metas.append(m)
-
-        return tensors, metas
-    except ImportError:
-        return None, None
-
-
-def display_tensor_table(tensors, metas):
-    """Display per-step tensor info in a table."""
-    import torch
-
-    print(f"  {'Step':>5}  {'Type':>8}  {'Shape':>25}  {'Dtype':>16}  "
-          f"{'Min':>10}  {'Max':>10}  {'Mean':>10}  {'Std':>10}")
-    print(f"  {'-'*5}  {'-'*8}  {'-'*25}  {'-'*16}  "
-          f"{'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
-
-    for i, (tensor, meta) in enumerate(zip(tensors, metas)):
-        is_prefill = meta.get("is_prefill", i == 0)
-        step_type = "prefill" if is_prefill else "decode"
-
-        t_float = tensor.float()
-        t_min = t_float.min().item()
-        t_max = t_float.max().item()
-        t_mean = t_float.mean().item()
-        t_std = t_float.std().item()
-
-        print(f"  {i:>5}  {step_type:>8}  {str(list(tensor.shape)):>25}  "
-              f"{str(tensor.dtype):>16}  {t_min:>+10.4f}  {t_max:>+10.4f}  "
-              f"{t_mean:>+10.4f}  {t_std:>10.4f}")
-
-    # Summary
-    stacked = torch.cat(tensors, dim=0)
-
-    print(f"\n{'='*70}")
-    print(f"  Summary")
-    print(f"{'='*70}")
-    print(f"  Total steps:           {len(tensors)}")
-    print(f"  Prefill tensor shape:  {list(tensors[0].shape)}")
-    print(f"  Decode tensor shape:   {list(tensors[-1].shape)}")
-    print(f"  Stacked shape:         {list(stacked.shape)}")
-    print(f"  Hidden dimension:      {stacked.shape[-1]}")
-    print(f"  Dtype:                 {stacked.dtype}")
-    print(f"  Device:                {stacked.device}")
-    print(f"  GPU memory (stacked):  {stacked.element_size() * stacked.numel() / 1024:.1f} KB")
-
-    s_float = stacked.float()
-    print(f"\n  Overall stats:")
-    print(f"    Min:  {s_float.min().item():+.6f}")
-    print(f"    Max:  {s_float.max().item():+.6f}")
-    print(f"    Mean: {s_float.mean().item():+.6f}")
-    print(f"    Std:  {s_float.std().item():.6f}")
-
-
-def display_handle_info(handles, kv_params):
-    """Display handle metadata when tensors aren't directly accessible."""
-    print(f"  ⚠ Running in a SEPARATE process — cannot access GPU buffer directly.")
-    print(f"    The handles are only valid inside the vLLM worker process.\n")
-    print(f"  Metadata from API response:")
-    print(f"    Steps:  {kv_params.get('hidden_states_num_steps', len(handles))}")
-    print(f"    Dtype:  {kv_params.get('hidden_states_dtype', 'N/A')}")
-    print(f"    Layer:  {kv_params.get('hidden_states_layer', 'N/A')}")
-    print(f"    Device: {kv_params.get('hidden_states_device', 'N/A')}")
-    print(f"\n  Handle IDs ({len(handles)} total):")
-
-    # Show first few and last few
-    show_n = 5
-    for i, h in enumerate(handles[:show_n]):
-        label = "prefill" if i == 0 else f"decode"
-        print(f"    Step {i:>3} ({label:>8}): {h}")
-    if len(handles) > show_n * 2:
-        print(f"    {'...':>28}  ({len(handles) - show_n * 2} more)")
-    for i, h in enumerate(handles[-show_n:], start=len(handles) - show_n):
-        print(f"    Step {i:>3} ({'decode':>8}): {h}")
-
-    print(f"\n  To access tensors, consume them IN the vLLM worker process:")
-    print(f"    from vllm_hidden_states_extractor.consumer import StreamingHiddenStatesConsumer")
-    print(f"    consumer = StreamingHiddenStatesConsumer()")
-    print(f"    for tensor, meta in consumer.iter_steps(handles):")
-    print(f"        print(tensor.shape)  # prefill: [seq_len, H], decode: [1, H]")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Inspect streaming hidden states")
+    parser = argparse.ArgumentParser(description="Inspect streaming hidden states via API")
     parser.add_argument("--url", default="http://localhost:8000")
     parser.add_argument("--prompt", default="What is the capital of France?")
     parser.add_argument("--max-tokens", type=int, default=20)
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--no-free", action="store_true",
+                        help="Don't free buffer slots after consuming")
     args = parser.parse_args()
 
     # ── Step 1: Generate ──
@@ -154,11 +38,20 @@ def main():
     print(f"  Model:      {args.model}\n")
 
     try:
-        result = fetch_hidden_states(args.url, args.prompt, args.max_tokens, args.model)
+        resp = requests.post(
+            f"{args.url}/v1/completions",
+            json={
+                "model": args.model,
+                "prompt": args.prompt,
+                "max_tokens": args.max_tokens,
+            },
+        )
+        resp.raise_for_status()
     except requests.exceptions.ConnectionError:
         print(f"  ✗ Cannot connect to {args.url}")
         sys.exit(1)
 
+    result = resp.json()
     kv_params = result.get("kv_transfer_params", {})
     handles = kv_params.get("hidden_states_handles", [])
 
@@ -174,17 +67,85 @@ def main():
         print("\n  ✗ No handles — nothing to consume.")
         sys.exit(0)
 
-    # ── Step 2: Try to consume tensors ──
+    # ── Step 2: Consume via API ──
     print(f"\n{'='*70}")
-    print(f"  Per-Step Tensor Inspection")
-    print(f"{'='*70}")
+    print(f"  Consuming tensors via /hidden_states/consume")
+    print(f"{'='*70}\n")
 
-    tensors, metas = try_consume_in_process(handles)
+    try:
+        consume_resp = requests.post(
+            f"{args.url}/hidden_states/consume",
+            json={
+                "handles": handles,
+                "free_after": not args.no_free,
+            },
+        )
+        consume_resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f"  ✗ API error: {e}")
+        print(f"    Make sure you started the server with run_server.py")
+        sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        print(f"  ✗ Cannot connect to {args.url}/hidden_states/consume")
+        print(f"    Make sure you started the server with run_server.py")
+        sys.exit(1)
 
-    if tensors:
-        display_tensor_table(tensors, metas)
-    else:
-        display_handle_info(handles, kv_params)
+    data = consume_resp.json()
+
+    # ── Display per-step table ──
+    steps = data.get("steps", [])
+    print(f"  {'Step':>5}  {'Type':>8}  {'Shape':>25}  {'Dtype':>16}  "
+          f"{'Min':>10}  {'Max':>10}  {'Mean':>10}  {'Std':>10}")
+    print(f"  {'-'*5}  {'-'*8}  {'-'*25}  {'-'*16}  "
+          f"{'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
+
+    for step in steps:
+        if step.get("status") != "ok":
+            print(f"  {step['step']:>5}  {'?':>8}  {'-- not found --':>25}")
+            continue
+
+        t = step["tensor"]
+        meta = step.get("metadata", {})
+        is_prefill = meta.get("is_prefill", step["step"] == 0)
+        step_type = "prefill" if is_prefill else "decode"
+
+        print(f"  {step['step']:>5}  {step_type:>8}  {str(t['shape']):>25}  "
+              f"{t['dtype']:>16}  {t['min']:>+10.4f}  {t['max']:>+10.4f}  "
+              f"{t['mean']:>+10.4f}  {t['std']:>10.4f}")
+
+    # ── Summary ──
+    summary = data.get("summary")
+    if summary:
+        print(f"\n{'='*70}")
+        print(f"  Summary")
+        print(f"{'='*70}")
+        print(f"  Total steps:           {summary['total_steps']}")
+        print(f"  Prefill tensor shape:  {summary['prefill_shape']}")
+        print(f"  Decode tensor shape:   {summary['decode_shape']}")
+        print(f"  Stacked shape:         {summary['stacked_shape']}")
+        print(f"  Hidden dimension:      {summary['hidden_dim']}")
+        print(f"  Total tokens:          {summary['total_tokens']}")
+        print(f"  GPU memory:            {summary['memory_bytes'] / 1024:.1f} KB")
+        print(f"  Slots freed:           {summary['freed']}")
+
+        overall = summary.get("overall_stats", {})
+        if overall:
+            print(f"\n  Overall stats:")
+            print(f"    Min:  {overall['min']:+.6f}")
+            print(f"    Max:  {overall['max']:+.6f}")
+            print(f"    Mean: {overall['mean']:+.6f}")
+            print(f"    Std:  {overall['std']:.6f}")
+            print(f"    Norm: {overall['norm']:.6f}")
+
+    # ── Buffer stats ──
+    try:
+        stats_resp = requests.get(f"{args.url}/hidden_states/buffer_stats")
+        if stats_resp.ok:
+            stats = stats_resp.json()
+            print(f"\n  Buffer: {stats['active_slots']}/{stats['max_slots']} active, "
+                  f"{stats['free_slots']} free, {stats.get('expired', 0)} expired")
+    except Exception:
+        pass
 
     print(f"\n{'='*70}")
     print(f"  ✓ Done!")
