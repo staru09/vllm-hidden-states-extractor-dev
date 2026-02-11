@@ -131,9 +131,16 @@ def _polling_loop(stop_event: threading.Event, poll_interval: float = 0.01):
     logger.info("[RealtimeConsumer] Polling stopped")
 
 
+
+# Singleton state
+_consumer_lock = threading.Lock()
+_consumer_stop_fn = None
+
+
 def start_consumer(poll_interval: float = 0.01) -> callable:
     """
     Start the real-time consumer in a background thread.
+    Idempotent: if already running, returns the existing stop function.
 
     Args:
         poll_interval: seconds between polls (default 10ms)
@@ -141,21 +148,32 @@ def start_consumer(poll_interval: float = 0.01) -> callable:
     Returns:
         stop_fn: call this to stop the consumer thread
     """
-    stop_event = threading.Event()
-    thread = threading.Thread(
-        target=_polling_loop,
-        args=(stop_event, poll_interval),
-        daemon=True,
-        name="hidden-states-realtime-consumer",
-    )
-    thread.start()
+    global _consumer_stop_fn
 
-    def stop():
-        stop_event.set()
-        thread.join(timeout=5.0)
-        logger.info("[RealtimeConsumer] Thread joined")
+    with _consumer_lock:
+        if _consumer_stop_fn is not None:
+            logger.info("[RealtimeConsumer] Already running, returning existing stop_fn")
+            return _consumer_stop_fn
 
-    return stop
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_polling_loop,
+            args=(stop_event, poll_interval),
+            daemon=True,
+            name="hidden-states-realtime-consumer",
+        )
+        thread.start()
+
+        def stop():
+            global _consumer_stop_fn
+            stop_event.set()
+            thread.join(timeout=5.0)
+            logger.info("[RealtimeConsumer] Thread joined")
+            with _consumer_lock:
+                _consumer_stop_fn = None
+
+        _consumer_stop_fn = stop
+        return stop
 
 
 def maybe_auto_start():
