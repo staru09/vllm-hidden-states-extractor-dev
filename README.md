@@ -127,7 +127,7 @@ flowchart LR
 1. Serve the model with the activation connector (requires `--enforce-eager`):
 
 ```bash
-HIDDEN_STATES_REALTIME_CONSUMER=1 HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve Qwen/Qwen3-8B --enforce-eager \
+HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve Qwen/Qwen3-8B --enforce-eager \
   --kv-transfer-config '{
     "kv_connector": "HiddenActivationsConnector",
     "kv_role": "kv_producer",
@@ -179,6 +179,37 @@ tensor, metadata = consumer.get("d8bc117d-1e3")
 output = my_model(tensor)
 consumer.free("d8bc117d-1e3")
 ```
+
+### Real-Time Consumer (Streaming)
+
+To process hidden states **as they are generated** (in a background thread), use the Real-Time Consumer.
+
+1.  Enable it via environment variable:
+
+    ```bash
+    export HIDDEN_STATES_REALTIME_CONSUMER=1
+    ```
+
+2.  Run the server (same as above):
+
+    ```bash
+    HIDDEN_STATES_REALTIME_CONSUMER=1 HIDDEN_ACTIVATIONS_ENABLED=1 vllm serve Qwen/Qwen3-8B --enforce-eager ...
+    ```
+
+3.  Customize the logic:
+    Edit `src/vllm_hidden_states_extractor/realtime_consumer.py`. The `_polling_loop` function contains a section marked `SECONDARY MODEL LOGIC` where you can inject your code.
+
+    ```python
+    # src/vllm_hidden_states_extractor/realtime_consumer.py
+
+    # ... inside the loop ...
+    if tensor is not None:
+        # YOUR CODE HERE
+        # tensor is on GPU, shape [seq_len, hidden_size]
+        my_model(tensor)
+
+        # Buffer is freed automatically after this block
+    ```
 
 ### Supported Models
 
