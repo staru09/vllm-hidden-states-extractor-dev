@@ -211,6 +211,10 @@ class HiddenActivationsConnector(KVConnectorBase_V1):
 
         _capture_enabled = True
 
+        # Auto-start real-time consumer if requested
+        from vllm_hidden_states_extractor.realtime_consumer import maybe_auto_start
+        self._consumer_stop_fn = maybe_auto_start()
+
         logger.info(
             f"HiddenActivationsConnector initialized: "
             f"layer={_layer_index}, buffer_size={buffer_size}, ttl={buffer_ttl}s"
