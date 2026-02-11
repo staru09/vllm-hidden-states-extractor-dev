@@ -272,11 +272,11 @@ class HiddenActivationsConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Return all buffer handles for the captured hidden states.
+        """Return all buffer handles AND per-step tensor info.
 
-        Returns a list of handles — one per forward step (prefill + each
-        decode step). The consumer can iterate through them to get the
-        full sequence of hidden states.
+        Returns handles, shapes, and stats for every forward step
+        (prefill + each decode step) directly in kv_transfer_params,
+        so no separate API is needed to inspect the tensors.
         """
         global _current_request_token_counts
 
@@ -287,22 +287,54 @@ class HiddenActivationsConnector(KVConnectorBase_V1):
         _current_request_token_counts.pop(req_id, None)
 
         if handles:
-            # Peek at the first handle for dtype/layer info
             buffer = get_global_buffer()
-            _, first_meta = buffer.get(handles[0])
-            dtype = first_meta.get("dtype", "") if first_meta else ""
+
+            # Build per-step info and collect tensors for summary
+            steps = []
+            all_tensors = []
+            for i, handle in enumerate(handles):
+                tensor, meta = buffer.get(handle)
+                if tensor is not None:
+                    t_float = tensor.float()
+                    steps.append({
+                        "step": i,
+                        "handle": handle,
+                        "shape": list(tensor.shape),
+                        "is_prefill": meta.get("is_prefill", False),
+                        "min": round(t_float.min().item(), 6),
+                        "max": round(t_float.max().item(), 6),
+                        "mean": round(t_float.mean().item(), 6),
+                        "std": round(t_float.std().item(), 6),
+                    })
+                    all_tensors.append(tensor)
+
+            # Overall summary
+            dtype = steps[0].get("dtype", "") if steps else ""
+            if all_tensors:
+                stacked = torch.cat(all_tensors, dim=0)
+                stacked_shape = list(stacked.shape)
+                hidden_dim = stacked.shape[-1]
+                total_tokens = stacked.shape[0]
+            else:
+                stacked_shape = []
+                hidden_dim = 0
+                total_tokens = 0
 
             logger.info(
                 f"Request {req_id}: {len(handles)} hidden state steps captured, "
-                f"dtype={dtype}, layer={_layer_index}"
+                f"stacked_shape={stacked_shape}, layer={_layer_index}"
             )
 
             return False, {
                 "hidden_states_handles": handles,
                 "hidden_states_num_steps": len(handles),
-                "hidden_states_dtype": dtype,
+                "hidden_states_dtype": str(all_tensors[0].dtype) if all_tensors else "",
                 "hidden_states_layer": _layer_index,
                 "hidden_states_device": "gpu",
+                "hidden_states_steps": steps,
+                "hidden_states_stacked_shape": stacked_shape,
+                "hidden_states_hidden_dim": hidden_dim,
+                "hidden_states_total_tokens": total_tokens,
             }
         else:
             logger.warning(f"No hidden states captured for request {req_id}")
