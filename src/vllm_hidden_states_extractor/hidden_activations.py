@@ -15,6 +15,7 @@ Architecture:
 
 import os
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -45,8 +46,8 @@ logger = init_logger(__name__)
 # ─── Global state for hook <-> connector communication ───
 # The hook writes here, the connector reads from here.
 # No locks needed: single-threaded GPU execution in vLLM worker.
-_pending_hidden_states: Dict[str, str] = {}  # req_id -> buffer_handle
-_current_active_requests: List[str] = []      # req_ids being processed
+_pending_hidden_states: Dict[str, List[str]] = defaultdict(list)  # req_id -> [handle, ...]
+_current_request_token_counts: Dict[str, int] = {}  # req_id -> num_tokens_in_batch
 _layer_index: int = 20                         # configurable
 _capture_enabled: bool = False
 
@@ -54,13 +55,18 @@ _capture_enabled: bool = False
 def _make_activation_hook(layer_idx: int):
     """
     Create a forward hook for a specific layer.
-    
+
     The hook captures the layer output tensor, stores it in the
     GPU buffer manager, and records the handle for the current request.
-    
+
+    For each forward pass, the batch tensor is sliced per-request using
+    _current_request_token_counts (populated from SchedulerOutput.
+    num_scheduled_tokens). Each request gets its own tensor slice stored
+    as a separate buffer handle.
+
     IMPORTANT: No locks, no CPU sync, no torch-unsupported ops.
     The tensor stays on GPU.
-    
+
     NOTE: We call get_global_buffer() at runtime (not via closure)
     to ensure we always use the current buffer instance, even if
     init_global_buffer() was called after hook registration.
@@ -68,7 +74,7 @@ def _make_activation_hook(layer_idx: int):
     def hook(module, input, output):
         if not _capture_enabled:
             return
-        if not _current_active_requests:
+        if not _current_request_token_counts:
             return
 
         # Extract hidden states from output
@@ -80,22 +86,26 @@ def _make_activation_hook(layer_idx: int):
         # Get the current buffer (not closure-captured)
         buffer = get_global_buffer()
 
-        # Store in GPU buffer for each active request
-        for req_id in _current_active_requests:
-            if req_id in _pending_hidden_states:
-                # Already captured for this request (multi-step decode)
-                continue
+        # Slice per-request using token counts.
+        # _current_request_token_counts is ordered (Python 3.7+ dict),
+        # matching the order tokens appear in the batch tensor.
+        offset = 0
+        for req_id, num_tokens in _current_request_token_counts.items():
+            # Slice this request's tokens from the batch
+            req_hidden = hidden_states[offset:offset + num_tokens]
+            offset += num_tokens
 
             handle = buffer.store(
-                hidden_states,
+                req_hidden,
                 metadata={
                     "req_id": req_id,
                     "layer_idx": layer_idx,
-                    "shape": list(hidden_states.shape),
-                    "dtype": str(hidden_states.dtype),
+                    "shape": list(req_hidden.shape),
+                    "dtype": str(req_hidden.dtype),
+                    "is_prefill": num_tokens > 1,
                 },
             )
-            _pending_hidden_states[req_id] = handle
+            _pending_hidden_states[req_id].append(handle)
 
     return hook
 
@@ -244,13 +254,16 @@ class HiddenActivationsConnector(KVConnectorBase_V1):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> KVConnectorMetadata:
-        """Track active requests so the hook knows which requests are running."""
-        global _current_active_requests
+        """Track ALL active requests so the hook captures every step.
+
+        Uses num_scheduled_tokens which includes both new prefill requests
+        and ongoing decode requests, with their token counts per step.
+        """
+        global _current_request_token_counts
         meta = ActivationsConnectorMetadata()
 
-        # Update active request list for the hook
-        new_req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
-        _current_active_requests = new_req_ids
+        # num_scheduled_tokens: dict[str, int] — covers all active requests
+        _current_request_token_counts = dict(scheduler_output.num_scheduled_tokens)
 
         return meta
 
@@ -259,37 +272,41 @@ class HiddenActivationsConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Return the buffer handle for the captured hidden states."""
-        global _current_active_requests
+        """Return all buffer handles for the captured hidden states.
+
+        Returns a list of handles — one per forward step (prefill + each
+        decode step). The consumer can iterate through them to get the
+        full sequence of hidden states.
+        """
+        global _current_request_token_counts
 
         req_id = request.request_id
-        handle = _pending_hidden_states.pop(req_id, None)
+        handles = list(_pending_hidden_states.pop(req_id, []))
 
-        # Remove from active list
-        if req_id in _current_active_requests:
-            _current_active_requests.remove(req_id)
+        # Remove from active tracking
+        _current_request_token_counts.pop(req_id, None)
 
-        if handle:
+        if handles:
+            # Peek at the first handle for dtype/layer info
             buffer = get_global_buffer()
-            tensor, metadata = buffer.get(handle)
-            shape = metadata.get("shape", []) if metadata else []
-            dtype = metadata.get("dtype", "") if metadata else ""
+            _, first_meta = buffer.get(handles[0])
+            dtype = first_meta.get("dtype", "") if first_meta else ""
 
             logger.info(
-                f"Request {req_id}: hidden states handle={handle}, "
-                f"shape={shape}, dtype={dtype}"
+                f"Request {req_id}: {len(handles)} hidden state steps captured, "
+                f"dtype={dtype}, layer={_layer_index}"
             )
 
             return False, {
-                "hidden_states_handle": handle,
-                "hidden_states_shape": shape,
+                "hidden_states_handles": handles,
+                "hidden_states_num_steps": len(handles),
                 "hidden_states_dtype": dtype,
                 "hidden_states_layer": _layer_index,
                 "hidden_states_device": "gpu",
             }
         else:
             logger.warning(f"No hidden states captured for request {req_id}")
-            return False, {"hidden_states_handle": None}
+            return False, {"hidden_states_handles": []}
 
     def clear_connector_metadata(self):
         pass

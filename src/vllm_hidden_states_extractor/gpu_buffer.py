@@ -59,8 +59,8 @@ class GPUBufferManager:
 
     def __init__(
         self,
-        max_slots: int = 64,
-        default_ttl: float = 30.0,
+        max_slots: int = 512,
+        default_ttl: float = 60.0,
         device: str = "cuda:0",
     ):
         self._max_slots = max_slots
@@ -203,8 +203,8 @@ def get_global_buffer() -> GPUBufferManager:
 
 
 def init_global_buffer(
-    max_slots: int = 64,
-    default_ttl: float = 30.0,
+    max_slots: int = 512,
+    default_ttl: float = 60.0,
     device: str = "cuda:0",
 ) -> GPUBufferManager:
     """Initialize the global GPU buffer manager."""
