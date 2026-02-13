@@ -1,16 +1,8 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Hidden Activations Connector for vLLM.
 
 Captures hidden activations from a configurable layer during inference,
-stores them in a GPU buffer (no CPU sync), and returns a buffer handle
-in the API response.
-
-Architecture:
-    1. Plugin patches the model class to register a forward hook on target layer
-    2. Hook captures the layer output and stores in GPUBufferManager (stays on GPU)
-    3. Connector's request_finished() returns the buffer handle in kv_transfer_params
-    4. Consumer process reads the tensor using the handle (via CUDA IPC or co-process API)
+stores them in a GPU buffer and returns a buffer handle in the API response.
 """
 
 import os

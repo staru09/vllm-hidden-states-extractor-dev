@@ -1,16 +1,9 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 GPU Buffer Manager for hidden activations extraction.
 
 Manages a pool of GPU-resident tensors with handle-based access.
 Tensors stay on GPU and are accessible via CUDA IPC handles
 for cross-process consumption.
-
-Key design:
-- Pre-allocated ring buffer to avoid dynamic allocation during inference
-- Handle-based access (integer IDs) returned to clients
-- TTL-based expiry for unclaimed tensors
-- CUDA IPC handle generation for cross-process access
 """
 
 import time

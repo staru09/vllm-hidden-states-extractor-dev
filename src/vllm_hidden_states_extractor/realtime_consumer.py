@@ -1,20 +1,13 @@
 """
 Real-time in-process hidden states consumer.
 
-Runs as a background thread inside the vLLM worker process, polling
-_pending_hidden_states for new handles and logging tensor info as
-each token is generated.
+Runs as a background thread inside the vLLM worker process, polling _pending_hidden_states for new handles and logging tensor info as each token is generated.
 
 Start it automatically by setting:
     HIDDEN_STATES_REALTIME_CONSUMER=1
 
-Or start manually from within the vLLM process:
-    from vllm_hidden_states_extractor.realtime_consumer import start_consumer
-    stop_fn = start_consumer()
-    # ... later ...
-    stop_fn()  # to stop polling
 """
-
+import torch
 import threading
 import time
 import logging
@@ -37,7 +30,6 @@ def _polling_loop(stop_event: threading.Event, poll_interval: float = 0.01):
     consumed_counts: dict[str, int] = {}
     
     # Store accumulated tensors per request: req_id -> list[torch.Tensor]
-    import torch
     request_accumulators: dict[str, list[torch.Tensor]] = {}
 
     logger.info("[RealtimeConsumer] Polling started")
@@ -79,7 +71,8 @@ def _polling_loop(stop_event: threading.Event, poll_interval: float = 0.01):
                         
                         # Free the buffer slot immediately!
                         # This keeps GPU memory usage low (only 1-2 slots active per req).
-                        buffer.free(handle)
+                        # [MODIFIED] User requested to keep tensors for post-hoc inspection
+                        # buffer.free(handle)
 
                         curr_len = sum(t.shape[0] for t in request_accumulators[req_id])
                         is_prefill = meta.get("is_prefill", False)
